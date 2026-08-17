@@ -1,0 +1,4 @@
+interface:
+  display_name: "抖音水评清理"
+  short_description: "按时间范围抓取抖音评论、识别水评并生成飞书清理结果表"
+  default_prompt: "Use $douyin-water-comment-audit to audit Douyin comments for water comments within a specified date range."
