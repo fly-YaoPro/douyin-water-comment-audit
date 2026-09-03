@@ -85,7 +85,7 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--log-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--detector-root", type=Path, default=Path(r"E:\豆包创作线Agent\MediaCrawler"))
+    parser.add_argument("--detector-root", type=Path, default=Path(r"E:\豆尼·银手\MediaCrawler"))
     parser.add_argument("--elapsed-seconds", type=int, default=0)
     parser.add_argument("--threshold", type=int, default=3)
     args = parser.parse_args()

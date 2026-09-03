@@ -1,10 +1,12 @@
+#requires -Version 7.0
+
 param(
     [Parameter(Mandatory = $true)][string]$Manifest,
-    [string]$CrawlerRoot = "E:\豆包创作线Agent\MediaCrawler",
+    [string]$CrawlerRoot = "E:\豆尼·银手\MediaCrawler",
     [Parameter(Mandatory = $true)][string]$OutputRoot,
     [int]$BatchSize = 20,
     [int]$MaxComments = 100,
-    [int]$CrawlerConcurrency = 3,
+    [int]$CrawlerConcurrency = 1,
     [int]$MaxAttempts = 2,
     [ValidateSet("yes", "no")][string]$Headless = "yes"
 )
@@ -13,6 +15,11 @@ $ErrorActionPreference = "Stop"
 $logRoot = Join-Path $OutputRoot "logs"
 $dataRoot = Join-Path $OutputRoot "data"
 New-Item -ItemType Directory -Force $OutputRoot, $logRoot, $dataRoot | Out-Null
+
+$python = Join-Path $CrawlerRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    throw "MediaCrawler virtualenv Python not found: $python"
+}
 
 $selected = @(Import-Csv -LiteralPath $Manifest)
 $total = $selected.Count
@@ -41,7 +48,7 @@ for ($offset = 0; $offset -lt $total; $offset += $BatchSize) {
         try {
             $savedPreference = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
-            & uv run main.py `
+            & $python main.py `
                 --platform dy `
                 --lt qrcode `
                 --type detail `
@@ -57,6 +64,23 @@ for ($offset = 0; $offset -lt $total; $offset += $BatchSize) {
             $ErrorActionPreference = $savedPreference
         } finally {
             Pop-Location
+        }
+
+        $detailRows = 0
+        Get-ChildItem -LiteralPath $batchData -Recurse -Filter "detail_contents_*.jsonl" -ErrorAction SilentlyContinue | ForEach-Object {
+            $detailRows += @(Get-Content -LiteralPath $_.FullName -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+        }
+        $accessRejected = @(Select-String -LiteralPath $logPath -Pattern "DOUYIN_LOGIN_REQUIRED|DOUYIN_ACCESS_REJECTED|account blocked" -Encoding UTF8 -ErrorAction SilentlyContinue).Count
+        Write-Output "BATCH_EVIDENCE number=$batchNo/$batchCount details=$detailRows access_rejected=$accessRejected"
+
+        if ($detailRows -eq 0 -and $accessRejected -gt 0) {
+            Write-Output "SCAN_ABORT reason=DOUYIN_ACCESS_REJECTED batch=$batchNo attempt=$attempt log=$logPath"
+            exit 3
+        }
+
+        if ($exitCode -eq 0 -and $detailRows -eq 0) {
+            $exitCode = 4
+            Write-Output "BATCH_NO_EVIDENCE number=$batchNo/$batchCount attempt=$attempt"
         }
 
         if ($exitCode -eq 0) {

@@ -1,4 +1,4 @@
 interface:
   display_name: "抖音水评清理"
-  short_description: "按时间范围抓取抖音评论、识别水评并生成飞书清理结果表"
-  default_prompt: "Use $douyin-water-comment-audit to audit Douyin comments for water comments within a specified date range."
+  short_description: "识别抖音水评，24/48小时复查并确认后分机构处理"
+  default_prompt: "Use $douyin-water-comment-audit to audit Douyin comments within a specified date range, run 24-hour and 48-hour follow-ups, and ask the original requester for a fresh confirmation before each live institution dispatch."
