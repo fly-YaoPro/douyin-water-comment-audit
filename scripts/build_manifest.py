@@ -4,7 +4,10 @@ import argparse
 import csv
 import datetime as dt
 import json
+import os
 import re
+import sys
+import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -13,31 +16,24 @@ from pathlib import Path
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 REL_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 
-CANONICAL_COLOR_TO_INSTITUTION = {
-    "FBBFBC": "萌兽",
-    "FED4A4": "闪光点",
-    "FAF1D1": "纽微特",
-    "EEF6C6": "志森",
-    "7EDAFB": "睿立",
-    "DEE0E3": "金铲子",
-    "FFF258": "筑石",
-    "34C724": "山恒",
-    "AD82F7": "杭杭",
-    "FF5833": "肆野",
-    "FE8802": "诺信",
-    "BACFFE": "映画",
-}
+def config_path(flag: str, filename: str) -> Path:
+    if flag in sys.argv:
+        index = sys.argv.index(flag)
+        if index + 1 >= len(sys.argv):
+            raise ValueError(f"{flag} 缺少路径")
+        return Path(sys.argv[index + 1])
+    return Path(os.environ.get("DOUNI_WORKSPACE", str(Path.cwd()))) / "config" / filename
 
-# 兼容客户表旧色块；新写入统一按上面的 12 色版本识别。
-LEGACY_COLOR_TO_INSTITUTION = {
-    "F54A45": "肆野",
-}
+
+POLICY = json.loads(config_path("--business-policy", "business-policy.json").read_text(encoding="utf-8-sig"))
+CANONICAL_COLOR_TO_INSTITUTION = {color.lstrip("#"): name for name, color in POLICY["institutionColors"].items()}
+LEGACY_COLOR_TO_INSTITUTION = {color.lstrip("#"): name for color, name in POLICY["legacyInstitutionColors"].items()}
 
 COLOR_TO_INSTITUTION = {
     **CANONICAL_COLOR_TO_INSTITUTION,
     **LEGACY_COLOR_TO_INSTITUTION,
 }
-COLOR_DISTANCE_TOLERANCE = 8
+COLOR_DISTANCE_TOLERANCE = POLICY["colorDistanceTolerance"]
 
 
 def read_csv(path: Path) -> list[list[str]]:
@@ -129,7 +125,7 @@ def sheet_xml_path(zf: zipfile.ZipFile, sheet_name: str) -> str:
     raise ValueError(f"XLSX 中找不到 Sheet {sheet_name!r}; 可用: {available}")
 
 
-def read_ar_cells(xlsx: Path, sheet_name: str) -> dict[int, tuple[str, str]]:
+def read_marker_cells(xlsx: Path, sheet_name: str, column: str) -> dict[int, tuple[str, str]]:
     with zipfile.ZipFile(xlsx) as zf:
         styles = ET.fromstring(zf.read("xl/styles.xml"))
         fills_node = styles.find("m:fills", NS)
@@ -153,7 +149,7 @@ def read_ar_cells(xlsx: Path, sheet_name: str) -> dict[int, tuple[str, str]]:
         worksheet = ET.fromstring(zf.read(sheet_xml_path(zf, sheet_name)))
         output: dict[int, tuple[str, str]] = {}
         for cell in worksheet.findall(".//m:c", NS):
-            match = re.fullmatch(r"AR(\d+)", cell.attrib.get("r", ""))
+            match = re.fullmatch(rf"{re.escape(column.upper())}(\d+)", cell.attrib.get("r", ""))
             if not match:
                 continue
             style_id = int(cell.attrib.get("s", "0"))
@@ -187,6 +183,23 @@ def institution(ar_text: str, color: str) -> str:
 
 def clean(value: str) -> str:
     return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def current_project_special(value: str) -> str | None:
+    """Map the current customer publication ledger's 对应项目 to audit categories."""
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).casefold()
+    patterns = POLICY["projectPatterns"]
+    if re.search(patterns["dual_bundle"], text) or re.search(patterns["independent"], text):
+        return None  # 本函数仅拆分原抖音主表；独立端由独立来源处理。
+    if re.search(patterns["course_teaching"], text):
+        return "课程教学"
+    if re.search(patterns["work_task"], text):
+        return "工作任务"
+    return None
+
+
+def identity(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip().casefold()
 
 
 def normalize_header(value: str) -> str:
@@ -249,6 +262,8 @@ def process_custom_source(
         "missing_link": 0,
         "unmapped_institution": 0,
         "self_built": 0,
+        "excluded_other_project": 0,
+        "unclassified_project": 0,
         "selected": 0,
     }
     records: list[dict] = []
@@ -268,10 +283,11 @@ def process_custom_source(
         if not url:
             stats["missing_link"] += 1
             continue
-        aweme_id = clean(cell(row, "aweme_id"))
+        # 长链里的视频 ID 是本行发布事实；短链无法解析时回退 GID。
+        url_match = re.search(r"(?:/video/|modal_id=|vid=)(\d{10,30})", url)
+        aweme_id = url_match.group(1) if url_match else clean(cell(row, "aweme_id"))
         if not re.fullmatch(r"\d+", aweme_id):
-            match = re.search(r"(?:/video/|modal_id=|vid=)(\d{10,30})", url)
-            aweme_id = match.group(1) if match else ""
+            aweme_id = ""
         org = cell(row, "institution") or "未标注"
         if org == "未标注":
             stats["unmapped_institution"] += 1
@@ -300,9 +316,10 @@ def process_source(
     start: dt.date,
     end: dt.date,
     all_rows: bool,
+    classify_by_current_project: bool = False,
 ) -> tuple[list[dict], dict]:
     rows = read_csv(csv_path)
-    ar_cells = read_ar_cells(xlsx_path, sheet_name)
+    ar_cells = read_marker_cells(xlsx_path, sheet_name, "AR")
     stats = {
         "source_rows": max(0, len(rows) - 1),
         "outside_range": 0,
@@ -327,6 +344,13 @@ def process_source(
             # Full-table mode still requires a usable published date in output.
             stats["invalid_date"] += 1
             continue
+        if classify_by_current_project:
+            classified_special = current_project_special(row[1])
+            if classified_special != special:
+                stats["excluded_other_project"] += 1
+                if classified_special is None:
+                    stats["unclassified_project"] += 1
+                continue
         url = clean(row[11])
         if not url:
             stats["missing_link"] += 1
@@ -357,23 +381,154 @@ def process_source(
     return records, stats
 
 
+def independent_institution_hints(
+    review_csv: Path,
+    xlsx_path: Path,
+    review_sheet_name: str,
+) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
+    rows = read_csv(review_csv)
+    if not rows:
+        raise ValueError(f"独立端审核 Sheet {review_sheet_name!r} 没有可读数据")
+    headers = rows[0]
+    creator_column = find_column(headers, ("达人昵称", "达人名称", "达人", "昵称"))
+    profile_column = find_column(headers, ("主页链接", "达人主页", "主页"))
+    if creator_column is None or profile_column is None:
+        raise ValueError(f"独立端审核 Sheet 缺少达人昵称或主页链接；实际表头: {headers}")
+    markers = read_marker_cells(xlsx_path, review_sheet_name, "AS")
+    exact_candidates: dict[tuple[str, str], set[str]] = {}
+    creator_candidates: dict[str, set[str]] = {}
+    for row_no, row in enumerate(rows[1:], start=2):
+        creator = identity(row[creator_column] if creator_column < len(row) else "")
+        profile = identity(row[profile_column] if profile_column < len(row) else "")
+        color, marker_text = markers.get(row_no, ("", ""))
+        org = institution(marker_text, color)
+        if not creator or org == "未标注":
+            continue
+        exact_candidates.setdefault((creator, profile), set()).add(org)
+        creator_candidates.setdefault(creator, set()).add(org)
+    exact = {key: next(iter(values)) for key, values in exact_candidates.items() if len(values) == 1}
+    by_creator = {key: next(iter(values)) for key, values in creator_candidates.items() if len(values) == 1}
+    return exact, by_creator
+
+
+def process_independent_source(
+    csv_path: Path,
+    review_csv: Path,
+    xlsx_path: Path,
+    sheet_name: str,
+    review_sheet_name: str,
+    start: dt.date,
+    end: dt.date,
+    all_rows: bool,
+) -> tuple[list[dict], dict]:
+    rows = read_csv(csv_path)
+    if not rows:
+        raise ValueError(f"独立端发布 Sheet {sheet_name!r} 没有可读数据")
+    headers = rows[0]
+    columns = {
+        "published": find_column(headers, ("发布日期", "发布时间", "发布日", "日期")),
+        "creator": find_column(headers, ("达人昵称", "达人名称", "达人", "昵称")),
+        "profile": find_column(headers, ("主页链接", "达人主页", "主页")),
+        "video_url": find_column(headers, ("发布链接", "视频链接", "视频", "作品链接", "视频地址", "抖音链接")),
+        "aweme_id": find_column(headers, ("gid", "视频gid", "视频id", "抖音视频id")),
+        "special": find_column(headers, ("对应项目", "项目/专项", "项目类型", "专项", "业务线")),
+    }
+    missing = [
+        label for label, key in (("发布日期", "published"), ("达人昵称", "creator"), ("发布链接", "video_url"))
+        if columns[key] is None
+    ]
+    if missing:
+        raise ValueError(f"独立端发布 Sheet 缺少可识别字段: {missing}; 实际表头: {headers}")
+    exact_hints, creator_hints = independent_institution_hints(review_csv, xlsx_path, review_sheet_name)
+
+    def cell(row: list[str], key: str) -> str:
+        index = columns[key]
+        return row[index].strip() if index is not None and index < len(row) else ""
+
+    stats = {
+        "source_rows": max(0, len(rows) - 1), "outside_range": 0, "blank_date": 0,
+        "invalid_date": 0, "missing_link": 0, "unmapped_institution": 0,
+        "self_built": 0, "selected": 0,
+    }
+    records: list[dict] = []
+    for row_no, row in enumerate(rows[1:], start=2):
+        published_raw = cell(row, "published")
+        if not published_raw:
+            stats["blank_date"] += 1
+            continue
+        published = parse_date(published_raw, start, end)
+        if not published:
+            stats["invalid_date"] += 1
+            continue
+        if not all_rows and not start <= published <= end:
+            stats["outside_range"] += 1
+            continue
+        url = clean(cell(row, "video_url"))
+        if not url:
+            stats["missing_link"] += 1
+            continue
+        # 独立端表偶尔会把其他作品的 GID 残留到当前行。长链里的视频 ID
+        # 是本行发布事实，优先级高于可编辑的 GID；短链无法解析时才回退 GID。
+        url_match = re.search(r"(?:/video/|modal_id=|vid=)(\d{10,30})", url)
+        aweme_id = url_match.group(1) if url_match else clean(cell(row, "aweme_id"))
+        if not re.fullmatch(r"\d+", aweme_id):
+            aweme_id = ""
+        creator_key = identity(cell(row, "creator"))
+        profile_key = identity(cell(row, "profile"))
+        org = exact_hints.get((creator_key, profile_key)) or creator_hints.get(creator_key) or "未标注"
+        if org == "未标注":
+            stats["unmapped_institution"] += 1
+        if org == "自建":
+            stats["self_built"] += 1
+        records.append({
+            "source_row": row_no,
+            "publish_date": published.isoformat(),
+            "creator": cell(row, "creator"),
+            "video_url": url,
+            "aweme_id": aweme_id,
+            "institution": org,
+            "special": "独立端",
+            "ar_raw": org if org != "未标注" else "",
+            "ar_color": "",
+        })
+    stats["selected"] = len(records)
+    return records, stats
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--business-policy", type=Path)
+    parser.add_argument("--business-sources", type=Path)
     parser.add_argument("--work-csv", type=Path)
     parser.add_argument("--work-xlsx", type=Path)
-    parser.add_argument("--creation-csv", type=Path)
-    parser.add_argument("--creation-xlsx", type=Path)
+    parser.add_argument("--course-csv", type=Path)
+    parser.add_argument("--course-xlsx", type=Path)
+    parser.add_argument("--creation-csv", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--creation-xlsx", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--independent-csv", type=Path)
+    parser.add_argument("--independent-review-csv", type=Path)
+    parser.add_argument("--independent-xlsx", type=Path)
     parser.add_argument("--custom-csv", type=Path)
     parser.add_argument("--custom-xlsx", type=Path)
     parser.add_argument("--custom-sheet-name")
-    parser.add_argument("--work-sheet-name", default="视频发布（一口价）")
-    parser.add_argument("--creation-sheet-name", default="创作skill-视频发布")
+    parser.add_argument("--work-sheet-name")
+    parser.add_argument("--course-sheet-name")
+    parser.add_argument("--creation-sheet-name", help=argparse.SUPPRESS)
+    parser.add_argument("--independent-sheet-name")
+    parser.add_argument("--independent-review-sheet-name")
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--work-all", action="store_true")
-    parser.add_argument("--creation-all", action="store_true")
+    parser.add_argument("--course-all", action="store_true")
+    parser.add_argument("--creation-all", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--independent-all", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    sources = json.loads(config_path("--business-sources", "business-sources.json").read_text(encoding="utf-8-sig"))
+    args.work_sheet_name = args.work_sheet_name or sources["customers"]["douyin"]["publication"]["name"]
+    args.course_sheet_name = args.course_sheet_name or args.creation_sheet_name or sources["historicalCoursePublication"]["sheetName"]
+    args.independent_sheet_name = args.independent_sheet_name or sources["customers"]["independent"]["publication"]["name"]
+    args.independent_review_sheet_name = args.independent_review_sheet_name or sources["customers"]["independent"]["review"]["name"]
 
     start, end = dt.date.fromisoformat(args.start), dt.date.fromisoformat(args.end)
     if end < start:
@@ -383,23 +538,49 @@ def main() -> None:
         if not all((args.custom_csv, args.custom_xlsx, args.custom_sheet_name)):
             raise SystemExit("自定义数据源必须同时提供 --custom-csv/--custom-xlsx/--custom-sheet-name")
         custom, custom_stats = process_custom_source(args.custom_csv, args.custom_sheet_name, start, end)
-        work, creation = custom, []
-        work_stats, creation_stats = custom_stats, {
+        work, course, independent = custom, [], []
+        empty_stats = {
             "source_rows": 0, "outside_range": 0, "blank_date": 0, "invalid_date": 0,
             "missing_link": 0, "unmapped_institution": 0, "self_built": 0, "selected": 0,
         }
+        work_stats, course_stats, independent_stats = custom_stats, empty_stats, empty_stats.copy()
     else:
-        if not all((args.work_csv, args.work_xlsx, args.creation_csv, args.creation_xlsx)):
-            raise SystemExit("默认数据源必须提供工作任务与创作线的 CSV/XLSX")
+        course_csv = args.course_csv or args.creation_csv
+        course_xlsx = args.course_xlsx or args.creation_xlsx
+        course_sheet_name = args.course_sheet_name if not args.creation_sheet_name else args.creation_sheet_name
+        required = (args.work_csv, args.work_xlsx, course_csv, course_xlsx,
+                    args.independent_csv, args.independent_review_csv, args.independent_xlsx)
+        if not all(required):
+            raise SystemExit("默认数据源必须提供工作任务、课程教学、独立端三类客户发布数据及独立端审核映射")
         work, work_stats = process_source(
-            args.work_csv, args.work_xlsx, args.work_sheet_name, "工作任务", start, end, args.work_all
+            args.work_csv, args.work_xlsx, args.work_sheet_name, "工作任务", start, end, args.work_all,
+            classify_by_current_project=True,
         )
-        creation, creation_stats = process_source(
-            args.creation_csv, args.creation_xlsx, args.creation_sheet_name, "创作线", start, end, args.creation_all
+        current_course, current_course_stats = process_source(
+            args.work_csv, args.work_xlsx, args.work_sheet_name, "课程教学", start, end,
+            args.course_all or args.creation_all,
+            classify_by_current_project=True,
+        )
+        legacy_course, legacy_course_stats = process_source(
+            course_csv, course_xlsx, course_sheet_name, "课程教学", start, end,
+            args.course_all or args.creation_all
+        )
+        course = current_course + legacy_course
+        course_stats = {
+            key: current_course_stats.get(key, 0) + legacy_course_stats.get(key, 0)
+            for key in set(current_course_stats) | set(legacy_course_stats)
+        }
+        course_stats["current_ledger_selected"] = len(current_course)
+        course_stats["legacy_ledger_selected"] = len(legacy_course)
+        independent, independent_stats = process_independent_source(
+            args.independent_csv, args.independent_review_csv, args.independent_xlsx,
+            args.independent_sheet_name, args.independent_review_sheet_name,
+            start, end, args.independent_all
         )
 
     dedup: dict[str, dict] = {}
-    for record in work + creation:
+    all_records = work + course + independent
+    for record in all_records:
         key = record["aweme_id"] or record["video_url"].lower()
         if key not in dedup:
             dedup[key] = record
@@ -421,11 +602,12 @@ def main() -> None:
     summary = {
         "range": {"start": start.isoformat(), "end": end.isoformat()},
         "work": work_stats,
-        "creation": creation_stats,
+        "course": course_stats,
+        "independent": independent_stats,
         "mode": "custom_sheet" if custom_mode else "default_customer_sheets",
         **({"sheet_name": args.custom_sheet_name} if custom_mode else {}),
         "manifest_rows": len(records),
-        "duplicates_combined": len(work) + len(creation) - len(records),
+        "duplicates_combined": len(all_records) - len(records),
         "output": str(args.output.resolve()),
     }
     print(json.dumps(summary, ensure_ascii=False))
